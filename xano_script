@@ -1,0 +1,414 @@
+require("dotenv").config();
+const axios = require("axios");
+
+class EmbeddingGeneratorService {
+  constructor() {
+    this.config = {
+      xanoApiKey: process.env.XANO_API_KEY,
+      workspaceId: process.env.XANO_WORKSPACE_ID,
+      metaBaseURL:
+        process.env.XANO_META_BASE_URL ||
+        "https://x7bf-glhc-q5dj.f2.xano.io/api:meta",
+      openaiApiKey: process.env.OPENAI_API_KEY,
+      openaiModel: "text-embedding-3-large",
+      recordsPerPage: 1000,
+      tableId: 106,
+      rateLimitDelay: parseInt(process.env.RATE_LIMIT_DELAY || "100"),
+      maxRetries: 3,
+      retryDelay: 1000,
+      maxConcurrentRequests: 1000, // Maximum concurrent requests to OpenAI
+    };
+
+    this.validateConfig();
+
+    this.axios = axios.create({
+      headers: {
+        Authorization: `Bearer ${this.config.xanoApiKey}`,
+        "Content-Type": "application/json",
+        "x-data-source": "live",
+        accept: "application/json",
+      },
+      timeout: 300000,
+    });
+
+    this.openaiAxios = axios.create({
+      baseURL: "https://api.openai.com/v1",
+      headers: {
+        Authorization: `Bearer ${this.config.openaiApiKey}`,
+        "Content-Type": "application/json",
+      },
+      timeout: 60000,
+    });
+
+    this.totalRecords = 0;
+    this.processedRecords = 0;
+    this.skippedRecords = 0;
+    this.retryQueue = [];
+  }
+
+  validateConfig() {
+    const required = ["xanoApiKey", "workspaceId", "openaiApiKey"];
+    const missing = required.filter((key) => !this.config[key]);
+    if (missing.length > 0) {
+      throw new Error(
+        `Missing required environment variables: ${missing.join(", ")}`
+      );
+    }
+    this.log(
+      `Configured to process ${this.config.recordsPerPage} records per page with up to ${this.config.maxConcurrentRequests} concurrent requests.`
+    );
+  }
+
+  log(message, type = "INFO") {
+    console.log(`[${new Date().toISOString()}] ${type}: ${message}`);
+  }
+
+  hasNullEmbeddings(record) {
+    const embeddings = record.combined_embeddings;
+    return (
+      embeddings === null || 
+      embeddings === undefined || 
+      embeddings === "" ||
+      (Array.isArray(embeddings) && embeddings.length === 0) ||
+      (typeof embeddings === 'object' && Object.keys(embeddings).length === 0)
+    );
+  }
+
+async fetchRecords(page) {
+  const whereClause = "combined_embeddings,is,null";
+  const selectedFields = ["id", "job_title", "description", "combined_embeddings"];
+  const fieldsParam = `fields=${encodeURIComponent(selectedFields.join(","))}`;
+  
+  let url = `${this.config.metaBaseURL}/workspace/${this.config.workspaceId}/table/${this.config.tableId}/content?page=${page}&per_page=${this.config.recordsPerPage}&where=${encodeURIComponent(whereClause)}&${fieldsParam}`;
+
+  this.log(`Fetching records from page ${page} where combined_embeddings is null with fields: ${selectedFields.join(", ")}`);
+  
+  try {
+    let response = await this.axios.get(url);
+    let records = response.data?.items || [];
+    this.totalRecords = response.data?.itemsTotal || this.totalRecords;
+
+    if (records.length === 0) {
+      this.log(`No records found with where clause. Fetching all records and filtering manually...`, "WARN");
+      
+      url = `${this.config.metaBaseURL}/workspace/${this.config.workspaceId}/table/${this.config.tableId}/content?page=${page}&per_page=${this.config.recordsPerPage}&${fieldsParam}`;
+      response = await this.axios.get(url);
+      const allRecords = response.data?.items || [];
+      this.totalRecords = response.data?.itemsTotal || this.totalRecords;
+
+      records = allRecords.filter(record => {
+        const hasNull = this.hasNullEmbeddings(record);
+        if (!hasNull) {
+          this.skippedRecords++;
+        }
+        return hasNull;
+      });
+
+      this.log(`Filtered ${records.length} records with null embeddings from ${allRecords.length} total records`);
+    }
+
+    const filteredRecords = records.filter(record => {
+      const hasNull = this.hasNullEmbeddings(record);
+      if (!hasNull) {
+        this.log(`Skipping record ${record.id}: already has embeddings`, "WARN");
+        this.skippedRecords++;
+      }
+      return hasNull;
+    });
+
+    this.log(`Final count: ${filteredRecords.length} records need embeddings on page ${page}`);
+    return filteredRecords;
+
+  } catch (error) {
+    this.log(`Failed to fetch records from page ${page}: ${error.message}`, "ERROR");
+    this.log(`Error details: ${error.response?.data ? JSON.stringify(error.response.data) : 'No additional details'}`, "ERROR");
+    return [];
+  }
+}
+
+  async getTotalRecordsNeedingEmbeddings() {
+    try {
+      const whereClause = "combined_embeddings,is,null";
+      let url = `${this.config.metaBaseURL}/workspace/${this.config.workspaceId}/table/${this.config.tableId}/content?page=1&per_page=1&where=${encodeURIComponent(whereClause)}`;
+      
+      let response = await this.axios.get(url);
+      let totalWithNull = response.data?.itemsTotal || 0;
+
+      if (totalWithNull === 0) {
+        this.log("Where clause returned 0 results. Checking manually...", "WARN");
+        
+        let totalNeedingEmbeddings = 0;
+        let page = 1;
+        let consecutiveEmptyPages = 0;
+
+        while (consecutiveEmptyPages < 3) {
+          url = `${this.config.metaBaseURL}/workspace/${this.config.workspaceId}/table/${this.config.tableId}/content?page=${page}&per_page=${this.config.recordsPerPage}`;
+          response = await this.axios.get(url);
+          const records = response.data?.items || [];
+          
+          if (records.length === 0) {
+            consecutiveEmptyPages++;
+          } else {
+            consecutiveEmptyPages = 0;
+            const nullRecords = records.filter(record => this.hasNullEmbeddings(record));
+            totalNeedingEmbeddings += nullRecords.length;
+          }
+          
+          page++;
+          if (page > 10) break;
+        }
+
+        this.log(`Estimated ${totalNeedingEmbeddings} records need embeddings from manual check`);
+        return totalNeedingEmbeddings;
+      }
+
+      this.log(`Found ${totalWithNull} total records needing embeddings`);
+      return totalWithNull;
+
+    } catch (error) {
+      this.log(`Failed to get total count: ${error.message}`, "ERROR");
+      return 0;
+    }
+  }
+
+  validateInput(text) {
+    return typeof text === "string" ? text.trim() : "";
+  }
+
+  async generateEmbedding(recordId, jobTitle, description, retryCount = 0) {
+    const inputText = `${this.validateInput(jobTitle)}. ${this.validateInput(description)}`.trim();
+    if (!inputText) {
+      this.log(`Skipping record ${recordId}: input is empty`, "WARN");
+      return { recordId, success: false, error: "Empty input" };
+    }
+    
+    try {
+      this.log(`Sending embedding request for record ${recordId}`);
+      const response = await this.openaiAxios.post("/embeddings", {
+        input: inputText,
+        model: this.config.openaiModel,
+        encoding_format: "float",
+      });
+      
+      const embedding = response.data.data?.[0]?.embedding;
+      if (!embedding) throw new Error("No embedding returned");
+      
+      this.log(`Embedding generated for record ${recordId}`);
+      return { recordId, embedding, success: true };
+      
+    } catch (err) {
+      this.log(`Error generating embedding for record ${recordId}: ${err.message}`, "ERROR");
+      
+      if (retryCount < this.config.maxRetries) {
+        const delay = this.config.retryDelay * (retryCount + 1);
+        this.log(`Retrying record ${recordId} after ${delay}ms (attempt ${retryCount + 1})`, "WARN");
+        await new Promise((r) => setTimeout(r, delay));
+        return this.generateEmbedding(recordId, jobTitle, description, retryCount + 1);
+      }
+      
+      return { recordId, error: err.message, success: false };
+    }
+  }
+
+  async bulkUpdate(records) {
+    if (records.length === 0) {
+      this.log("No records to update", "WARN");
+      return;
+    }
+
+    const updates = records.map((r) => ({
+      row_id: r.recordId,
+      updates: { combined_embeddings: r.embedding },
+    }));
+
+    const batchSize = 100;
+    for (let i = 0; i < updates.length; i += batchSize) {
+      const chunk = updates.slice(i, i + batchSize);
+      this.log(`Sending batch ${Math.floor(i / batchSize) + 1} with ${chunk.length} records`);
+      
+      try {
+        await this.axios.post(
+          `${this.config.metaBaseURL}/workspace/${this.config.workspaceId}/table/${this.config.tableId}/content/bulk/patch`,
+          { items: chunk }
+        );
+        this.log(`✅ Batch ${Math.floor(i / batchSize) + 1} completed: ${chunk.length} records updated.`);
+      } catch (error) {
+        this.log(`Failed to update batch ${Math.floor(i / batchSize) + 1}: ${error.message}`, "ERROR");
+        throw error;
+      }
+    }
+
+    this.log(`✔️ Bulk update complete for ${records.length} records.`);
+  }
+
+ async retryFailedEmbeddings() {
+  this.log(`\n🔁 Starting fallback retry for failed or missed records...`);
+
+  let page = 1;
+  let retried = 0;
+  let consecutiveEmptyPages = 0;
+  const maxRetryPages = 10;
+
+  while (consecutiveEmptyPages < 3 && page <= maxRetryPages) {
+    const records = await this.fetchRecords(page);
+    if (!records.length) {
+      consecutiveEmptyPages++;
+      page++;
+      continue;
+    }
+
+    this.log(`🔄 Retrying ${records.length} missed records on page ${page}`);
+
+    const embeddingResults = await Promise.all(
+      records.map(record =>
+        this.generateEmbedding(record.id, record.job_title, record.description)
+      )
+    );
+
+    const successful = embeddingResults.filter(r => r.success);
+    const failed = embeddingResults.filter(r => !r.success);
+
+    if (successful.length > 0) {
+      await this.bulkUpdate(successful);
+      retried += successful.length;
+    }
+
+    if (failed.length > 0) {
+      this.log(`⚠️ Still failed ${failed.length} records in retry loop`, "WARN");
+      failed.forEach(f => this.log(`  - Record ${f.recordId}: ${f.error}`, "WARN"));
+    }
+
+    page++;
+  }
+
+  this.log(`✅ Fallback retry complete. ${retried} additional records updated.`);
+}
+
+
+async processPage(page) {
+  const startTime = Date.now(); // Start full-page timer
+
+  this.log(`\n--- Processing page ${page} ---`);
+
+  const fetchStart = Date.now();
+  const records = await this.fetchRecords(page);
+  const fetchDuration = ((Date.now() - fetchStart) / 1000).toFixed(2);
+
+  if (!records.length) {
+    this.log(`No records with null embeddings found on page ${page}.`, "INFO");
+    return false;
+  }
+
+  this.log(`📥 Fetched ${records.length} records in ${fetchDuration}s`);
+
+  this.log(`Processing ${records.length} records that need embeddings on page ${page}`);
+
+  const maxConcurrent = Math.min(records.length, this.config.maxConcurrentRequests);
+  this.log(`🚀 Sending up to ${maxConcurrent} concurrent embedding requests`);
+
+  const embeddingStart = Date.now();
+  const embeddingPromises = records.map(record =>
+    this.generateEmbedding(record.id, record.job_title, record.description)
+  );
+  const embeddingResults = await Promise.all(embeddingPromises);
+  const embeddingDuration = ((Date.now() - embeddingStart) / 1000).toFixed(2);
+
+  const successful = embeddingResults.filter((r) => r.success);
+  const failed = embeddingResults.filter((r) => !r.success);
+
+  this.log(`✅ Generated embeddings for ${successful.length}/${records.length} records in ${embeddingDuration}s`);
+
+  if (failed.length > 0) {
+    this.log(`⚠️ Failed to generate embeddings for ${failed.length} records`, "WARN");
+    failed.forEach(f => this.log(`  - Record ${f.recordId}: ${f.error}`, "WARN"));
+  }
+
+  let updateDuration = 0;
+  if (successful.length > 0) {
+    const updateStart = Date.now();
+    await this.bulkUpdate(successful);
+    updateDuration = ((Date.now() - updateStart) / 1000).toFixed(2);
+    this.log(`📤 Bulk update for ${successful.length} records completed in ${updateDuration}s`);
+    this.processedRecords += successful.length;
+  }
+
+  const totalDuration = ((Date.now() - startTime) / 1000).toFixed(2);
+  this.log(`⏱️ Page ${page} fully processed: fetch (${fetchDuration}s) + embed (${embeddingDuration}s) + update (${updateDuration}s) = total ${totalDuration}s`);
+
+  return records.length > 0;
+}
+
+
+
+  async run(startPage = 1) {
+    this.log(`\n🚀 Starting embedding generation from page ${startPage}`);
+    
+    const totalNeeding = await this.getTotalRecordsNeedingEmbeddings();
+    this.log(`📊 Estimated ${totalNeeding} total records need embeddings`);
+
+    let page = startPage;
+    let consecutiveEmptyPages = 0;
+    const maxEmptyPages = 15;
+
+    while (consecutiveEmptyPages < maxEmptyPages) {
+      try {
+        const hasRecords = await this.processPage(page);
+        
+        if (!hasRecords) {
+          consecutiveEmptyPages++;
+          this.log(`📄 Empty page detected (${consecutiveEmptyPages}/${maxEmptyPages})`, "INFO");
+        } else {
+          consecutiveEmptyPages = 0;
+        }
+
+        page++;
+
+        if (totalNeeding > 0) {
+          const progress = ((this.processedRecords / totalNeeding) * 100).toFixed(1);
+          this.log(`📈 Progress: ${progress}% (${this.processedRecords}/${totalNeeding})`);
+        }
+
+        if (this.config.rateLimitDelay && consecutiveEmptyPages === 0) {
+          this.log(`⏳ Waiting ${this.config.rateLimitDelay}ms before next page`);
+          await new Promise((r) => setTimeout(r, this.config.rateLimitDelay));
+        }
+
+      } catch (error) {
+        this.log(`❌ Error processing page ${page}: ${error.message}`, "ERROR");
+        consecutiveEmptyPages++;
+        
+        if (consecutiveEmptyPages >= maxEmptyPages) {
+          this.log(`Too many consecutive errors/empty pages. Stopping.`, "ERROR");
+          break;
+        }
+      }
+    }
+
+    await this.retryFailedEmbeddings();
+
+    this.log(`\n🎉 Processing complete!`);
+    this.log(`📊 Final Statistics:`);
+    this.log(`   - Total records processed: ${this.processedRecords}`);
+    this.log(`   - Total records skipped (already had embeddings): ${this.skippedRecords}`);
+    this.log(`   - Pages processed: ${page - startPage}`);
+  }
+}
+
+async function main() {
+  try {
+    const generator = new EmbeddingGeneratorService();
+    const pageArg = parseInt(process.argv[2] || "1", 10);
+    await generator.run(pageArg);
+    process.exit(0);
+  } catch (error) {
+    console.error(`[${new Date().toISOString()}] FATAL: ${error.message}`);
+    process.exit(1);
+  }
+}
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error(`[${new Date().toISOString()}] FATAL: Unhandled Rejection:`, reason);
+  process.exit(1);
+});
+
+main();
