@@ -5,3 +5,4 @@
 !.gitignore
 !xano_script
 !package*.json
+!.env.example
